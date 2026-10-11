@@ -21,13 +21,7 @@ pipeline {
                 'push',
                 'deploy',
                 'rollback'
-            ],
-            description: '''
-build    = Build Docker image only
-push     = Build and push image to AWS ECR
-deploy   = Build, push and deploy to Docker Swarm
-rollback = Roll back the Docker Swarm service
-'''
+            ]
         )
 
         gitParameter(
@@ -50,16 +44,9 @@ rollback = Roll back the Docker Swarm service
         ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_IMAGE       = "${ECR_REGISTRY}/${ECR_REPO}"
 
-        /*
-         * Docker Swarm Manager public IP or public DNS.
-         */
         MANAGER_HOST    = '54.82.194.125'
         MANAGER_USER    = 'ubuntu'
 
-        /*
-         * Confirm this name using:
-         * docker service ls
-         */
         SERVICE_NAME    = 'homework3_web'
 
         AWS_CREDENTIALS = 'aws-credentials'
@@ -226,9 +213,10 @@ rollback = Roll back the Docker Swarm service
                     echo "======================================"
 
                     docker buildx build \
-                        --platform linux/amd64,linux/arm64 \
-                        -t ${FULL_IMAGE_NAME} \
-                        --push \
+                        --platform linux/amd64 \
+                        --pull \
+                        --tag "${FULL_IMAGE_NAME}" \
+                        --load \
                         .
 
                     docker image inspect \
