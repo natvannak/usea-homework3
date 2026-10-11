@@ -121,7 +121,7 @@ pipeline {
         stage('Checkout Selected Version') {
             when {
                 expression {
-                    params.ACTION in ['build', 'push', 'deploy']
+                    params.ACTION in ['build', 'push']
                 }
             }
 
@@ -160,7 +160,7 @@ pipeline {
         stage('Check Required Commands') {
             when {
                 expression {
-                    params.ACTION in ['build', 'push', 'deploy']
+                    params.ACTION in ['build', 'push']
                 }
             }
 
@@ -199,7 +199,7 @@ pipeline {
         stage('Build Docker Image') {
             when {
                 expression {
-                    params.ACTION in ['build', 'push', 'deploy']
+                    params.ACTION == 'build'
                 }
             }
 
@@ -230,7 +230,7 @@ pipeline {
         stage('Push to AWS ECR') {
             when {
                 expression {
-                    params.ACTION in ['push', 'deploy']
+                    params.ACTION == 'push'
                 }
             }
 
