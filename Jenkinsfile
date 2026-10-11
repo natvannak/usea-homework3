@@ -708,7 +708,7 @@ pipeline {
                                 echo "======================================"
                                 echo "Selected-version rollback completed"
                                 echo "======================================"
-                                REMOTE_SCRIPT
+REMOTE_SCRIPT
                         '''
                     }
                 }
