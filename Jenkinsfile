@@ -71,7 +71,7 @@ pipeline {
                         error('ACTION is required.')
                     }
 
-                    if (action in ['build', 'push', 'deploy']) {
+                    if (action in ['build', 'push', 'deploy', 'rollback']) {
                         if (!version) {
                             error(
                                 'VERSION is required. ' +
@@ -460,6 +460,7 @@ pipeline {
             }
         }
 
+
         stage('Rollback Docker Swarm') {
             when {
                 expression {
@@ -478,9 +479,18 @@ pipeline {
                         )
                     }
 
+                    if (!(rollbackVersion ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/)) {
+                        error(
+                            "Invalid rollback VERSION '${rollbackVersion}'."
+                        )
+                    }
+
                     env.IMAGE_TAG = rollbackVersion
                     env.FULL_IMAGE_NAME =
                         "${env.ECR_IMAGE}:${rollbackVersion}"
+
+                    echo "Rollback version: ${env.IMAGE_TAG}"
+                    echo "Rollback image  : ${env.FULL_IMAGE_NAME}"
                 }
 
                 withCredentials([
@@ -504,24 +514,22 @@ pipeline {
 
                             trap cleanup_local EXIT INT TERM
 
-                            echo "======================================"
-                            echo "Preparing selected-version rollback"
-                            echo "======================================"
-                            echo "Service : ${SERVICE_NAME}"
-                            echo "Version : ${IMAGE_TAG}"
-                            echo "Image   : ${FULL_IMAGE_NAME}"
-
+                           
                             aws ecr describe-images \
                                 --region "${AWS_REGION}" \
                                 --repository-name "${ECR_REPO}" \
                                 --image-ids imageTag="${IMAGE_TAG}" \
                                 >/dev/null
 
+                            echo "Creating temporary ECR token..."
+
                             aws ecr get-login-password \
                                 --region "${AWS_REGION}" \
                                 > "${TOKEN_FILE}"
 
                             chmod 600 "${TOKEN_FILE}"
+
+                            echo "Copying ECR token to Swarm Manager..."
 
                             scp \
                                 -o BatchMode=yes \
@@ -531,80 +539,176 @@ pipeline {
                                 "${TOKEN_FILE}" \
                                 "${MANAGER_USER}@${MANAGER_HOST}:${REMOTE_TOKEN}"
 
+                            echo "Starting selected-version rollback..."
+
                             ssh \
                                 -o BatchMode=yes \
                                 -o ConnectTimeout=15 \
                                 -o StrictHostKeyChecking=no \
                                 -o UserKnownHostsFile=/dev/null \
                                 "${MANAGER_USER}@${MANAGER_HOST}" \
-                                "
-                                    set -eu
+                                bash -s -- \
+                                "${SERVICE_NAME}" \
+                                "${FULL_IMAGE_NAME}" \
+                                "${ECR_REGISTRY}" \
+                                "${REMOTE_TOKEN}" <<'REMOTE_SCRIPT'
+                                set -eu
 
-                                    REMOTE_TOKEN='${REMOTE_TOKEN}'
+                                SERVICE_NAME="$1"
+                                FULL_IMAGE_NAME="$2"
+                                ECR_REGISTRY="$3"
+                                REMOTE_TOKEN="$4"
 
-                                    cleanup_remote() {
-                                        rm -f \\"\${REMOTE_TOKEN}\\"
-                                    }
+                                cleanup_remote() {
+                                    rm -f "${REMOTE_TOKEN}"
+                                }
 
-                                    trap cleanup_remote EXIT INT TERM
+                                trap cleanup_remote EXIT INT TERM
 
-                                    echo 'Logging Docker into AWS ECR...'
+                                echo "======================================"
+                                echo "Selected-Version Rollback"
+                                echo "======================================"
+                                echo "Service : ${SERVICE_NAME}"
+                                echo "Image   : ${FULL_IMAGE_NAME}"
 
-                                    cat \\"\${REMOTE_TOKEN}\\" |
-                                    docker login \\
-                                        --username AWS \\
-                                        --password-stdin \\
-                                        '${ECR_REGISTRY}'
+                                if [ ! -f "${REMOTE_TOKEN}" ]; then
+                                    echo "ERROR: ECR token file was not received."
+                                    exit 1
+                                fi
 
-                                    if ! docker service inspect \\
-                                        '${SERVICE_NAME}' >/dev/null 2>&1
-                                    then
-                                        echo 'ERROR: Service does not exist:'
-                                        echo '${SERVICE_NAME}'
+                                echo "Logging Docker into AWS ECR..."
+
+                                docker login \
+                                    --username AWS \
+                                    --password-stdin \
+                                    "${ECR_REGISTRY}" \
+                                    < "${REMOTE_TOKEN}"
+
+                                echo "Checking Docker Swarm state..."
+
+                                SWARM_STATE="$(docker info \
+                                    --format '{{.Swarm.LocalNodeState}}')"
+
+                                CONTROL_AVAILABLE="$(docker info \
+                                    --format '{{.Swarm.ControlAvailable}}')"
+
+                                echo "Swarm state      : ${SWARM_STATE}"
+                                echo "Control available: ${CONTROL_AVAILABLE}"
+
+                                if [ "${SWARM_STATE}" != "active" ]; then
+                                    echo "ERROR: Docker Swarm is not active."
+                                    exit 1
+                                fi
+
+                                if [ "${CONTROL_AVAILABLE}" != "true" ]; then
+                                    echo "ERROR: This server is not a Swarm Manager."
+                                    exit 1
+                                fi
+
+                                echo "Checking service: ${SERVICE_NAME}"
+
+                                if ! docker service inspect \
+                                    "${SERVICE_NAME}" \
+                                    >/dev/null 2>&1
+                                then
+                                    echo "ERROR: Service does not exist: ${SERVICE_NAME}"
+                                    echo
+                                    echo "Available services:"
+                                    docker service ls
+                                    exit 1
+                                fi
+
+                                CURRENT_IMAGE_BEFORE="$(docker service inspect \
+                                    --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+                                    "${SERVICE_NAME}")"
+
+                                echo "Current image before update:"
+                                echo "${CURRENT_IMAGE_BEFORE}"
+
+                                echo "======================================"
+                                echo "Restoring selected image"
+                                echo "======================================"
+
+                                docker service update \
+                                    --with-registry-auth \
+                                    --image "${FULL_IMAGE_NAME}" \
+                                    --replicas 2 \
+                                    --update-parallelism 1 \
+                                    --update-delay 10s \
+                                    --update-order start-first \
+                                    --update-failure-action rollback \
+                                    --rollback-parallelism 1 \
+                                    --rollback-order stop-first \
+                                    --restart-condition any \
+                                    --restart-delay 5s \
+                                    --detach=false \
+                                    "${SERVICE_NAME}"
+
+                                CURRENT_IMAGE_AFTER="$(docker service inspect \
+                                    --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+                                    "${SERVICE_NAME}")"
+
+                                echo "======================================"
+                                echo "Verifying selected image"
+                                echo "======================================"
+                                echo "Expected: ${FULL_IMAGE_NAME}"
+                                echo "Current : ${CURRENT_IMAGE_AFTER}"
+
+                                case "${CURRENT_IMAGE_AFTER}" in
+                                    "${FULL_IMAGE_NAME}"|"${FULL_IMAGE_NAME}@sha256:"*)
+                                        echo "Selected version restored successfully."
+                                        ;;
+                                    *)
+                                        echo "ERROR: Service is using an unexpected image."
+                                        docker service ps --no-trunc "${SERVICE_NAME}"
+                                        exit 1
+                                        ;;
+                                esac
+
+                                EXPECTED_REPLICAS="$(docker service inspect \
+                                    --format '{{.Spec.Mode.Replicated.Replicas}}' \
+                                    "${SERVICE_NAME}")"
+
+                                ATTEMPT=1
+                                MAX_ATTEMPTS=30
+
+                                while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]
+                                do
+                                    RUNNING_REPLICAS="$(docker service ps \
+                                        --filter desired-state=running \
+                                        --format '{{.CurrentState}}' \
+                                        "${SERVICE_NAME}" |
+                                        grep -c '^Running' || true)"
+
+                                    echo "Replica check ${ATTEMPT}/${MAX_ATTEMPTS}: ${RUNNING_REPLICAS}/${EXPECTED_REPLICAS}"
+
+                                    if [ "${RUNNING_REPLICAS}" -eq "${EXPECTED_REPLICAS}" ]; then
+                                        echo "All replicas are running."
+                                        break
+                                    fi
+
+                                    if [ "${ATTEMPT}" -eq "${MAX_ATTEMPTS}" ]; then
+                                        echo "ERROR: Service replicas did not become healthy."
+                                        docker service ps --no-trunc "${SERVICE_NAME}"
                                         exit 1
                                     fi
 
-                                    echo '======================================'
-                                    echo 'Restoring selected image'
-                                    echo '======================================'
-                                    echo 'Image: ${FULL_IMAGE_NAME}'
+                                    ATTEMPT=$((ATTEMPT + 1))
+                                    sleep 5
+                                done
 
-                                    docker service update \\
-                                        --with-registry-auth \\
-                                        --image '${FULL_IMAGE_NAME}' \\
-                                        --replicas 2 \\
-                                        --placement-pref-add \\
-                                        'spread=node.hostname' \\
-                                        --update-parallelism 1 \\
-                                        --update-delay 10s \\
-                                        --update-order start-first \\
-                                        --update-failure-action rollback \\
-                                        --detach=false \\
-                                        '${SERVICE_NAME}'
+                                echo "======================================"
+                                echo "Running service tasks"
+                                echo "======================================"
 
-                                    CURRENT_IMAGE=\$(docker service inspect \\
-                                        --format \\
-                                        '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \\
-                                        '${SERVICE_NAME}')
+                                docker service ps \
+                                    --filter desired-state=running \
+                                    "${SERVICE_NAME}"
 
-                                    echo '======================================'
-                                    echo \\"Current image: \${CURRENT_IMAGE}\\"
-                                    echo '======================================'
-
-                                    case \\"\${CURRENT_IMAGE}\\" in
-                                        '${ECR_IMAGE}:${IMAGE_TAG}'*)
-                                            echo 'Selected version restored successfully.'
-                                            ;;
-                                        *)
-                                            echo 'ERROR: Service is using an unexpected image.'
-                                            exit 1
-                                            ;;
-                                    esac
-
-                                    docker service ps \\
-                                        --filter desired-state=running \\
-                                        '${SERVICE_NAME}'
-                                "
+                                echo "======================================"
+                                echo "Selected-version rollback completed"
+                                echo "======================================"
+                                REMOTE_SCRIPT
                         '''
                     }
                 }
