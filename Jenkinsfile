@@ -454,12 +454,27 @@ pipeline {
 
             steps {
                 script {
-                    if (!params.VERSION?.trim()) {
+                    def rollbackVersion = params.VERSION?.trim()
+
+                    if (!rollbackVersion) {
                         error('VERSION is required for rollback.')
                     }
 
-                    env.IMAGE_TAG = params.VERSION.trim()
-                    env.FULL_IMAGE_NAME = "${env.ECR_IMAGE}:${env.IMAGE_TAG}"
+                    if (!(rollbackVersion ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/)) {
+                        error("Invalid VERSION: ${rollbackVersion}")
+                    }
+
+                    env.IMAGE_TAG = rollbackVersion
+                    env.FULL_IMAGE_NAME =
+                        "${env.ECR_IMAGE}:${rollbackVersion}"
+
+                    echo '======================================'
+                    echo 'Rollback Information'
+                    echo '======================================'
+                    echo "Service : ${env.SERVICE_NAME}"
+                    echo "Version : ${env.IMAGE_TAG}"
+                    echo "Image   : ${env.FULL_IMAGE_NAME}"
+                    echo '======================================'
                 }
 
                 withCredentials([
@@ -470,50 +485,170 @@ pipeline {
                 ]) {
                     sshagent(["${SSH_CREDENTIALS}"]) {
                         sh '''
-                            set -e
+                            set -eu
 
-                            echo "Checking rollback image in ECR..."
+                            TOKEN_FILE="${WORKSPACE}/ecr-rollback-token.txt"
+                            REMOTE_TOKEN="/tmp/homework3-rollback-token.txt"
+
+                            cleanup_local() {
+                                rm -f "${TOKEN_FILE}"
+                            }
+
+                            trap cleanup_local EXIT INT TERM
+
+                            echo "======================================"
+                            echo "Checking rollback image in ECR"
+                            echo "======================================"
+
                             aws ecr describe-images \
                                 --region "${AWS_REGION}" \
                                 --repository-name "${ECR_REPO}" \
                                 --image-ids imageTag="${IMAGE_TAG}" \
                                 >/dev/null
 
+                            echo "Image found: ${FULL_IMAGE_NAME}"
+
+                            echo "======================================"
+                            echo "Creating ECR login token on Jenkins"
+                            echo "======================================"
+
+                            aws ecr get-login-password \
+                                --region "${AWS_REGION}" \
+                                > "${TOKEN_FILE}"
+
+                            if [ ! -s "${TOKEN_FILE}" ]; then
+                                echo "ERROR: ECR token is empty."
+                                exit 1
+                            fi
+
+                            chmod 600 "${TOKEN_FILE}"
+
+                            echo "======================================"
+                            echo "Copying ECR token to Swarm Manager"
+                            echo "======================================"
+
+                            scp \
+                                -o BatchMode=yes \
+                                -o ConnectTimeout=15 \
+                                -o StrictHostKeyChecking=no \
+                                -o UserKnownHostsFile=/dev/null \
+                                "${TOKEN_FILE}" \
+                                "${MANAGER_USER}@${MANAGER_HOST}:${REMOTE_TOKEN}"
+
+                            echo "======================================"
+                            echo "Starting rollback"
+                            echo "======================================"
+
                             ssh \
+                                -o BatchMode=yes \
+                                -o ConnectTimeout=15 \
+                                -o ServerAliveInterval=10 \
+                                -o ServerAliveCountMax=6 \
                                 -o StrictHostKeyChecking=no \
                                 -o UserKnownHostsFile=/dev/null \
                                 "${MANAGER_USER}@${MANAGER_HOST}" \
-                                "
-                                    set -e
+                                bash -s -- \
+                                "${SERVICE_NAME}" \
+                                "${FULL_IMAGE_NAME}" \
+                                "${ECR_REGISTRY}" \
+                                "${REMOTE_TOKEN}" <<'REMOTE_SCRIPT'
+                            set -eu
 
-                                    echo 'Docker Login ECR'
+                            SERVICE_NAME="$1"
+                            FULL_IMAGE_NAME="$2"
+                            ECR_REGISTRY="$3"
+                            REMOTE_TOKEN="$4"
 
-                                    aws ecr get-login-password \
-                                        --region ${AWS_REGION} | \
-                                    docker login \
-                                        --username AWS \
-                                        --password-stdin \
-                                        ${ECR_REGISTRY}
+                            cleanup_remote() {
+                                rm -f "${REMOTE_TOKEN}"
+                            }
 
-                                    echo 'Rollback Service'
+                            trap cleanup_remote EXIT INT TERM
 
-                                    docker service update \
-                                        --with-registry-auth \
-                                        --image ${FULL_IMAGE_NAME} \
-                                        --update-order stop-first \
-                                        --update-parallelism 1 \
-                                        --update-delay 10s \
-                                        --detach=false \
-                                        ${SERVICE_NAME}
+                            echo "======================================"
+                            echo "Selected-Version Rollback"
+                            echo "======================================"
+                            echo "Service: ${SERVICE_NAME}"
+                            echo "Image  : ${FULL_IMAGE_NAME}"
+                            echo "======================================"
 
-                                    echo 'Current Image:'
-                                    docker service inspect \
-                                        --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
-                                        ${SERVICE_NAME}
+                            if [ ! -s "${REMOTE_TOKEN}" ]; then
+                                echo "ERROR: ECR token was not received."
+                                exit 1
+                            fi
 
-                                    echo 'Service Tasks:'
-                                    docker service ps ${SERVICE_NAME}
-                                "
+                            if ! docker service inspect \
+                                "${SERVICE_NAME}" >/dev/null 2>&1
+                            then
+                                echo "ERROR: Service not found: ${SERVICE_NAME}"
+                                docker service ls
+                                exit 1
+                            fi
+
+                            SWARM_CONTROL="$(docker info \
+                                --format '{{.Swarm.ControlAvailable}}')"
+
+                            if [ "${SWARM_CONTROL}" != "true" ]; then
+                                echo "ERROR: This server is not a Swarm Manager."
+                                exit 1
+                            fi
+
+                            echo "Logging Docker into ECR..."
+
+                            docker login \
+                                --username AWS \
+                                --password-stdin \
+                                "${ECR_REGISTRY}" \
+                                < "${REMOTE_TOKEN}"
+
+                            CURRENT_IMAGE="$(docker service inspect \
+                                --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+                                "${SERVICE_NAME}")"
+
+                            echo "Current image : ${CURRENT_IMAGE}"
+                            echo "Rollback image: ${FULL_IMAGE_NAME}"
+
+                            echo "Updating Docker Swarm service..."
+
+                            docker service update \
+                                --with-registry-auth \
+                                --image "${FULL_IMAGE_NAME}" \
+                                --update-parallelism 1 \
+                                --update-delay 10s \
+                                --update-order stop-first \
+                                --update-failure-action rollback \
+                                --detach=false \
+                                "${SERVICE_NAME}"
+
+                            UPDATED_IMAGE="$(docker service inspect \
+                                --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
+                                "${SERVICE_NAME}")"
+
+                            echo "======================================"
+                            echo "Rollback Result"
+                            echo "======================================"
+                            echo "Expected: ${FULL_IMAGE_NAME}"
+                            echo "Current : ${UPDATED_IMAGE}"
+
+                            case "${UPDATED_IMAGE}" in
+                                "${FULL_IMAGE_NAME}"|"${FULL_IMAGE_NAME}@sha256:"*)
+                                    echo "Rollback completed successfully."
+                                    ;;
+                                *)
+                                    echo "ERROR: Rollback image verification failed."
+                                    docker service ps \
+                                        --no-trunc \
+                                        "${SERVICE_NAME}"
+                                    exit 1
+                                    ;;
+                            esac
+
+                            echo "======================================"
+                            echo "Service Tasks"
+                            echo "======================================"
+
+                            docker service ps "${SERVICE_NAME}"
+REMOTE_SCRIPT
                         '''
                     }
                 }
