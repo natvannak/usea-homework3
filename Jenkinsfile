@@ -468,40 +468,145 @@ pipeline {
             }
 
             steps {
-                sshagent(["${SSH_CREDENTIALS}"]) {
-                    sh '''
-                        set -eu
+                script {
+                    def rollbackVersion = params.VERSION?.trim()
 
-                        echo "======================================"
-                        echo "Rolling back Docker Swarm service"
-                        echo "Service: ${SERVICE_NAME}"
-                        echo "======================================"
+                    if (!rollbackVersion) {
+                        error(
+                            'VERSION is required for rollback. ' +
+                            'Select the image version to restore.'
+                        )
+                    }
 
-                        ssh \
-                            -o BatchMode=yes \
-                            -o ConnectTimeout=10 \
-                            -o StrictHostKeyChecking=no \
-                            -o UserKnownHostsFile=/dev/null \
-                            "${MANAGER_USER}@${MANAGER_HOST}" \
-                            "
-                                set -eu
+                    env.IMAGE_TAG = rollbackVersion
+                    env.FULL_IMAGE_NAME =
+                        "${env.ECR_IMAGE}:${rollbackVersion}"
+                }
 
-                                if ! docker service inspect \\
-                                    '${SERVICE_NAME}' >/dev/null 2>&1
-                                then
-                                    echo 'ERROR: Service does not exist:'
-                                    echo '${SERVICE_NAME}'
-                                    docker service ls
-                                    exit 1
-                                fi
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ]
+                ]) {
+                    sshagent(['swarm-ssh-key']) {
+                        sh '''
+                            set -eu
 
-                                docker service rollback \\
-                                    --detach=false \\
-                                    '${SERVICE_NAME}'
+                            TOKEN_FILE="${WORKSPACE}/ecr-token.txt"
+                            REMOTE_TOKEN="/tmp/homework3-rollback-token.txt"
 
-                                echo 'Rollback completed successfully.'
-                            "
-                    '''
+                            cleanup_local() {
+                                rm -f "${TOKEN_FILE}"
+                            }
+
+                            trap cleanup_local EXIT INT TERM
+
+                            echo "======================================"
+                            echo "Preparing selected-version rollback"
+                            echo "======================================"
+                            echo "Service : ${SERVICE_NAME}"
+                            echo "Version : ${IMAGE_TAG}"
+                            echo "Image   : ${FULL_IMAGE_NAME}"
+
+                            aws ecr describe-images \
+                                --region "${AWS_REGION}" \
+                                --repository-name "${ECR_REPO}" \
+                                --image-ids imageTag="${IMAGE_TAG}" \
+                                >/dev/null
+
+                            aws ecr get-login-password \
+                                --region "${AWS_REGION}" \
+                                > "${TOKEN_FILE}"
+
+                            chmod 600 "${TOKEN_FILE}"
+
+                            scp \
+                                -o BatchMode=yes \
+                                -o ConnectTimeout=15 \
+                                -o StrictHostKeyChecking=no \
+                                -o UserKnownHostsFile=/dev/null \
+                                "${TOKEN_FILE}" \
+                                "${MANAGER_USER}@${MANAGER_HOST}:${REMOTE_TOKEN}"
+
+                            ssh \
+                                -o BatchMode=yes \
+                                -o ConnectTimeout=15 \
+                                -o StrictHostKeyChecking=no \
+                                -o UserKnownHostsFile=/dev/null \
+                                "${MANAGER_USER}@${MANAGER_HOST}" \
+                                "
+                                    set -eu
+
+                                    REMOTE_TOKEN='${REMOTE_TOKEN}'
+
+                                    cleanup_remote() {
+                                        rm -f \\"\${REMOTE_TOKEN}\\"
+                                    }
+
+                                    trap cleanup_remote EXIT INT TERM
+
+                                    echo 'Logging Docker into AWS ECR...'
+
+                                    cat \\"\${REMOTE_TOKEN}\\" |
+                                    docker login \\
+                                        --username AWS \\
+                                        --password-stdin \\
+                                        '${ECR_REGISTRY}'
+
+                                    if ! docker service inspect \\
+                                        '${SERVICE_NAME}' >/dev/null 2>&1
+                                    then
+                                        echo 'ERROR: Service does not exist:'
+                                        echo '${SERVICE_NAME}'
+                                        exit 1
+                                    fi
+
+                                    echo '======================================'
+                                    echo 'Restoring selected image'
+                                    echo '======================================'
+                                    echo 'Image: ${FULL_IMAGE_NAME}'
+
+                                    docker service update \\
+                                        --with-registry-auth \\
+                                        --image '${FULL_IMAGE_NAME}' \\
+                                        --replicas 2 \\
+                                        --placement-pref-add \\
+                                        'spread=node.hostname' \\
+                                        --update-parallelism 1 \\
+                                        --update-delay 10s \\
+                                        --update-order start-first \\
+                                        --update-failure-action rollback \\
+                                        --detach=false \\
+                                        '${SERVICE_NAME}'
+
+                                    CURRENT_IMAGE=\$(docker service inspect \\
+                                        --format \\
+                                        '{{.Spec.TaskTemplate.ContainerSpec.Image}}' \\
+                                        '${SERVICE_NAME}')
+
+                                    echo '======================================'
+                                    echo \\"Current image: \${CURRENT_IMAGE}\\"
+                                    echo '======================================'
+
+                                    case \\"\${CURRENT_IMAGE}\\" in
+                                        '${ECR_IMAGE}:${IMAGE_TAG}'*)
+                                            echo 'Selected version restored successfully.'
+                                            ;;
+                                        *)
+                                            echo 'ERROR: Service is using an unexpected image.'
+                                            exit 1
+                                            ;;
+                                    esac
+
+                                    docker service ps \\
+                                        --filter desired-state=running \\
+                                        '${SERVICE_NAME}'
+                                "
+                        '''
+                    }
                 }
             }
         }
