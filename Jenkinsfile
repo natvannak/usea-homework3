@@ -441,16 +441,22 @@ pipeline {
                                         exit 1
                                     fi
 
+                                    docker service create \
+                                        --name homework3_web \
+                                        --replicas 2 \
+                                        --placement-pref 'spread=node.hostname' \
+                                        --publish published=80,target=80 \
+                                        --with-registry-auth \
+                                        ${FULL_IMAGE_NAME}
                                     echo 'Updating Docker Swarm service...'
 
-                                    docker service update \\
-                                        --with-registry-auth \\
-                                        --image '${FULL_IMAGE_NAME}' \\
-                                        --update-parallelism 1 \\
-                                        --update-delay 10s \\
-                                        --update-failure-action rollback \\
-                                        --detach=false \\
-                                        '${SERVICE_NAME}'
+                                    docker service update \
+                                        --with-registry-auth \
+                                        --image "${FULL_IMAGE_NAME}" \
+                                        --replicas 2 \
+                                        --force \
+                                        --detach=false \
+                                        "${SERVICE_NAME}"
 
                                     echo 'Deployment completed successfully.'
                                 "
@@ -633,14 +639,11 @@ pipeline {
                                     --with-registry-auth \
                                     --image "${FULL_IMAGE_NAME}" \
                                     --replicas 2 \
+                                    --placement-pref-add 'spread=node.hostname' \
                                     --update-parallelism 1 \
                                     --update-delay 10s \
                                     --update-order start-first \
                                     --update-failure-action rollback \
-                                    --rollback-parallelism 1 \
-                                    --rollback-order stop-first \
-                                    --restart-condition any \
-                                    --restart-delay 5s \
                                     --detach=false \
                                     "${SERVICE_NAME}"
 
